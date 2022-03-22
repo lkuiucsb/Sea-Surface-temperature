@@ -31,7 +31,7 @@ for (i in 1:(range+1)) {
   
   write.path <- paste0("data/temperature/",date1,".nc")
   
-  download.file(input.path,write.path,quiet=T,method="curl",mode="wb")
+  download.file(input.path,write.path,quiet=T,method="auto",mode="wb")
   
   
   begin_d <- begin_d+1
