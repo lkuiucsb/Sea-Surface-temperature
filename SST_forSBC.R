@@ -18,6 +18,7 @@ end_d<- as.Date("2021-01-10")
 
 range <- as.integer(end_d-begin_d)
 
+prog.bar <- txtProgressBar(min=0, max=(range+1), style=3)
 for (i in 1:(range+1)) {
   
   year1 = format(begin_d,format="%Y")
@@ -36,6 +37,7 @@ for (i in 1:(range+1)) {
   
   begin_d <- begin_d+1
   
+  setTxtProgressBar(prog.bar, i) 
 }
 
 #download is finished. 
