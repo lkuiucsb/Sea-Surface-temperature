@@ -3,6 +3,7 @@ rm(list = ls())
 #-----------------------------------------------------------------------------
 #extract temperature data satellite and compile into one data table
 library(tidyverse)
+library(httr)
 
 setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
 
@@ -32,34 +33,78 @@ sitetb <- read.csv("data/site_tb.csv") %>%
 #using the date range below as an example
 # note that ERDDAP sometimes will download one more day of data, end_d+1, to make sure data cover the time spam you ask for. 
 begin_d <- as.Date("2024-01-01") # The start date for this satellite is 2002-06-01. The earlier date is not valid. 
-end_d<- as.Date("2024-01-10") # the data updated daily, so the end date can be today's date.
+end_d<- as.Date("2024-03-15") # the data updated daily, so the end date can be today's date.
 
 base_url <- "https://coastwatch.pfeg.noaa.gov/erddap/griddap/jplMURSST41.csv"
 
 #show txt progress bar to monitor the download process
 prog.bar <- txtProgressBar(min=0, max=(nrow(sitetb)), style=3)
 
-#a loop to download the daily csv files from the ERDDAP server, one loop for one siteid.
-for (i in 1:nrow(sitetb)) {
-  
-  #site id
-  site <- sitetb$siteid[i]
-  
-  # Construct the full URL with the appropriate query parameters
-  full_url <- paste0(base_url, "?analysed_sst",
-                     "[(", begin_d,"T00:00:00Z", "):1:(", end_d,"T23:59:59Z", ")]",
-                     "[(", sitetb$min_lat[i], "):1:(", sitetb$max_lat[i], ")]",
-                     "[(", sitetb$min_lon[i], "):1:(", sitetb$max_lon[i], ")]")
-  
-  #specify where the file will be downloaded to in your local folder, make sure you have a "data" folder with "temperature" subfolder in your working directory 
-  write.path <- paste0("data/temperature/",site,".csv")
-  
-  #download the file and save to the local folder
-  download.file(full_url,write.path,quiet=T,method="auto",mode="wb")
-  
-  #show the progress bar
-  setTxtProgressBar(prog.bar, i) 
+# ensure output folder exists
+if (!dir.exists("data/temperature")) dir.create("data/temperature", recursive = TRUE)
+
+# improved safe downloader: returns TRUE on success, retries with exponential backoff for retryable HTTP codes
+safe_download <- function(url, dest, retries = 5, timeout_sec = 240) {
+  for (attempt in seq_len(retries)) {
+    res <- try(
+      httr::GET(
+        url,
+        httr::user_agent("R (httr)"),
+        httr::write_disk(dest, overwrite = TRUE),
+        httr::timeout(timeout_sec)
+      ),
+      silent = TRUE
+    )
+    if (inherits(res, "try-error")) {
+      if (attempt < retries) {
+        Sys.sleep(2 ^ attempt)
+        next
+      } else stop("Download error: ", url)
+    }
+    code <- httr::status_code(res)
+    if (code >= 200 && code < 300) return(invisible(TRUE))
+    # retry transient server / rate-limit responses
+    if (code %in% c(408, 429, 500, 502, 503, 504) && attempt < retries) {
+      Sys.sleep(2 ^ attempt)
+      next
+    }
+    stop("Failed to download: ", url, " (HTTP ", code, ")")
+  }
 }
+
+# replace single large-request loop with chunked downloads (monthly by default)
+chunk_by <- "month" # use "week" if month chunks still time out
+
+for (i in seq_len(nrow(sitetb))) {
+  site <- sitetb$siteid[i]
+  month_starts <- seq(begin_d, end_d, by = chunk_by)
+  # ensure final chunk endpoint covers end_d
+  month_starts <- unique(c(month_starts, end_d + 1))
+  for (m in seq_len(length(month_starts) - 1)) {
+    chunk_start <- month_starts[m]
+    chunk_end <- pmin(end_d, month_starts[m + 1] - 1)
+    # build ERDDAP query with explicit YYYY-MM-DD formatting
+    full_url <- paste0(
+      base_url, "?analysed_sst",
+      "[(", format(chunk_start, "%Y-%m-%d"), "T00:00:00Z):1:(",
+      format(chunk_end, "%Y-%m-%d"), "T23:59:59Z)]",
+      "[(", sitetb$min_lat[i], "):1:(", sitetb$max_lat[i], ")]",
+      "[(", sitetb$min_lon[i], "):1:(", sitetb$max_lon[i], ")]"
+    )
+    write.path <- file.path("data", "temperature",
+                            paste0(site, "_", format(chunk_start, "%Y%m%d"), "-", format(chunk_end, "%Y%m%d"), ".csv"))
+
+ # attempt download but don't abort entire run on single-chunk failure
+    tryCatch(
+      safe_download(full_url, write.path, retries = 5, timeout_sec = 240),
+      error = function(e) {
+        message("Warning: chunk failed for ", site, " ", format(chunk_start), " to ", format(chunk_end), " -- ", e$message)
+      }
+    )
+  }
+  setTxtProgressBar(prog.bar, i)
+}
+close(prog.bar)
 
 #download is finished. 
 #The next step is to concat the sst csv files for all sites.
@@ -78,7 +123,9 @@ read_and_label_csv <- function(file) {
   
   colnames(df) <- colnames(cname)
   
-  df$siteid <- gsub(".csv", "", basename(file))
+  bn <- tools::file_path_sans_ext(basename(file))
+
+  df$siteid <- strsplit(bn, "_")[[1]][1]
   return(df)
 }
 
